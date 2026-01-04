@@ -664,3 +664,156 @@ document.addEventListener("visibilitychange", () => {
 
 // Boot
 boot().catch((e) => logE("boot", "boot() exception", e));
+
+
+// ===== DEBUG STATE =====
+const dbg = {
+  lastGazeAt: 0,
+  lastNextPointAt: 0,
+  lastCollectAt: 0,
+  lastCalProgressAt: 0,
+  calProgressRaw: null,
+  calRunning: false,
+};
+
+function dlog(...args) {
+  // 콘솔 + (있으면) 화면 로그 모두 남기기
+  const msg = `[${new Date().toISOString()}] ` + args.map(a => {
+    try { return typeof a === "string" ? a : JSON.stringify(a); }
+    catch { return String(a); }
+  }).join(" ");
+  console.log(msg);
+
+  const pre = document.getElementById("debugLog"); // <pre id="debugLog"></pre> 있으면 사용
+  if (pre) {
+    pre.textContent = (pre.textContent + "\n" + msg).slice(-20000); // 최근 20KB만 유지
+  }
+}
+
+// ===== CALIBRATION CALLBACKS (IMPORTANT) =====
+function bindSeesoCallbacks(seeso, els) {
+  // 1) Gaze callback: "진짜 gaze가 들어오는지" 확인 (calibration은 gaze 입력이 전제)
+  seeso.addGazeCallback((gazeInfo) => {
+    dbg.lastGazeAt = Date.now();
+    // trackingState / x,y가 계속 갱신되는지 확인
+    dlog("onGaze", {
+      x: gazeInfo?.x,
+      y: gazeInfo?.y,
+      trackingState: gazeInfo?.trackingState,
+      eyeMovementState: gazeInfo?.eyeMovementState,
+    });
+  });
+
+  // 2) Calibration Next Point: 여기서 점을 그린 뒤 startCollectSamples()를 호출해야 진행률이 오름
+  seeso.addCalibrationNextPointCallback((pointX, pointY) => {
+    dbg.lastNextPointAt = Date.now();
+    dlog("onCalibrationNextPoint", { pointX, pointY });
+
+    // (예) 캔버스에 녹색 점 그리기
+    const ctx = els.canvas.getContext("2d");
+    ctx.clearRect(0, 0, els.canvas.width, els.canvas.height);
+    ctx.beginPath();
+    ctx.arc(pointX, pointY, 14, 0, Math.PI * 2);
+    ctx.fillStyle = "#00ff3b";
+    ctx.fill();
+
+    // 점이 "화면에 렌더된 다음" 샘플 수집 시작 (0% 고정 해결 핵심)
+    requestAnimationFrame(() => {
+      setTimeout(() => {
+        dbg.lastCollectAt = Date.now();
+        let ret;
+        try {
+          ret = seeso.startCollectSamples(); // ★★★ 필수 ★★★
+        } catch (e) {
+          dlog("startCollectSamples() EXCEPTION", String(e));
+          return;
+        }
+        dlog("startCollectSamples() CALLED", { returnValue: ret });
+      }, 80);
+    });
+  });
+
+  // 3) Calibration progress: 값이 오는지/형태(0~1인지)를 로그로 확인
+  seeso.addCalibrationProgressCallback((progress) => {
+    dbg.lastCalProgressAt = Date.now();
+    dbg.calProgressRaw = progress;
+
+    const pct = (typeof progress === "number")
+      ? Math.round(progress * 100)
+      : NaN;
+
+    dlog("onCalibrationProgress", { progress, pct });
+
+    // 화면 문구 갱신 (사용자가 0%만 보지 않도록)
+    const calTextEl = document.getElementById("calText"); // 있으면 사용
+    if (calTextEl && Number.isFinite(pct)) {
+      calTextEl.textContent = `Calibrating... ${pct}% (keep your head steady, look at the green dot)`;
+    }
+  });
+
+  // 4) Calibration finished: 완료 여부/데이터 길이 등 확인
+  seeso.addCalibrationFinishCallback((calibrationData) => {
+    dbg.calRunning = false;
+    dlog("onCalibrationFinished", {
+      type: typeof calibrationData,
+      length: calibrationData?.length,
+      preview: (typeof calibrationData === "string")
+        ? calibrationData.slice(0, 60) + "..."
+        : null
+    });
+  });
+
+  // 5) SDK debug callback(있으면): 성능/내부 상태 힌트
+  seeso.addDebugCallback((info) => {
+    dlog("onDebug", info);
+  });
+
+  // 6) Watchdog: "cal: running인데 이벤트가 안 오는 상황"을 1초마다 경고
+  setInterval(() => {
+    if (!dbg.calRunning) return;
+
+    const now = Date.now();
+    const gazeAgo = dbg.lastGazeAt ? (now - dbg.lastGazeAt) : null;
+    const nextPointAgo = dbg.lastNextPointAt ? (now - dbg.lastNextPointAt) : null;
+    const collectAgo = dbg.lastCollectAt ? (now - dbg.lastCollectAt) : null;
+    const progAgo = dbg.lastCalProgressAt ? (now - dbg.lastCalProgressAt) : null;
+
+    // 진행률 이벤트가 2초 이상 안 오면 원인 추적 메시지
+    if (!dbg.lastCalProgressAt || progAgo > 2000) {
+      dlog("WATCHDOG: cal running but no progress event", {
+        gazeAgoMs: gazeAgo,
+        nextPointAgoMs: nextPointAgo,
+        collectAgoMs: collectAgo,
+        lastProgressAgoMs: progAgo,
+        hint: "If nextPoint fires but progress stays 0%, ensure startCollectSamples() is called inside onCalibrationNextPoint."
+      });
+    }
+  }, 1000);
+}
+
+// ===== when you start calibration =====
+function startCalibrationFlow(seeso, points, criteria) {
+  dbg.calRunning = true;
+  dbg.lastNextPointAt = 0;
+  dbg.lastCollectAt = 0;
+  dbg.lastCalProgressAt = 0;
+  dbg.calProgressRaw = null;
+
+  dlog("startCalibration() REQUEST", { points, criteria });
+
+  let ok = false;
+  try {
+    ok = seeso.startCalibration(points, criteria);
+  } catch (e) {
+    dlog("startCalibration() EXCEPTION", String(e));
+    dbg.calRunning = false;
+    return;
+  }
+  dlog("startCalibration() RETURN", { ok });
+
+  if (!ok) {
+    dbg.calRunning = false;
+    dlog("Calibration did not start (startCalibration returned false)");
+  }
+}
+
