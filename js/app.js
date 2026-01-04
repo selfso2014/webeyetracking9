@@ -28,7 +28,7 @@ function clamp(v, min, max) {
   return Math.min(Math.max(v, min), max);
 }
 
-function createDot(id, sizePx, colorCss, glowCss) {
+function createDot(id, sizePx, cssText) {
   let dot = document.getElementById(id);
   if (dot) return dot;
 
@@ -44,29 +44,57 @@ function createDot(id, sizePx, colorCss, glowCss) {
     "transform:translate(-50%,-50%)",
     "pointer-events:none",
     "z-index:99999",
-    `background:${colorCss}`,
-    `box-shadow:${glowCss}`,
     "display:none",
+    cssText,
   ].join(";");
   document.body.appendChild(dot);
   return dot;
 }
 
-// 녹색 시선점
+// 시선점(움직이는 점) - 녹색 (요구사항)
 const gazeDot = createDot(
   "gazeDot",
   14,
-  "rgba(0,255,0,0.95)",
-  "0 0 0 2px rgba(0,0,0,0.55), 0 0 14px rgba(0,255,0,0.55)"
+  [
+    "background:rgba(0,255,0,0.95)",
+    "box-shadow:0 0 0 2px rgba(0,0,0,0.55), 0 0 14px rgba(0,255,0,0.55)",
+  ].join(";")
 );
 
-// 캘리브레이션 점(조금 더 크게)
-const calDot = createDot(
-  "calDot",
-  20,
-  "rgba(0,255,0,0.98)",
-  "0 0 0 2px rgba(0,0,0,0.75), 0 0 18px rgba(0,255,0,0.65)"
+// 캘리브레이션 타겟(고정점) - 녹색이지만 더 크고 “링 + 크로스헤어”로 구분
+const calTarget = createDot(
+  "calTarget",
+  34,
+  [
+    "background:transparent",
+    "box-shadow:0 0 0 3px rgba(0,255,0,0.95), 0 0 20px rgba(0,255,0,0.45)",
+  ].join(";")
 );
+
+// 캘리브레이션 타겟 내부 크로스헤어
+(function ensureCrosshair() {
+  const crossId = "calTargetCross";
+  let cross = document.getElementById(crossId);
+  if (cross) return;
+
+  cross = document.createElement("div");
+  cross.id = crossId;
+  cross.style.cssText = [
+    "position:fixed",
+    "left:-9999px",
+    "top:-9999px",
+    "width:34px",
+    "height:34px",
+    "transform:translate(-50%,-50%)",
+    "pointer-events:none",
+    "z-index:100000",
+    "display:none",
+    "background:",
+    "linear-gradient(transparent 48%, rgba(0,255,0,0.95) 48%, rgba(0,255,0,0.95) 52%, transparent 52%),",
+    "linear-gradient(90deg, transparent 48%, rgba(0,255,0,0.95) 48%, rgba(0,255,0,0.95) 52%, transparent 52%)",
+  ].join(";");
+  document.body.appendChild(cross);
+})();
 
 function showDot(dot, x, y) {
   const px = clamp(Number(x) || 0, 0, window.innerWidth);
@@ -82,6 +110,17 @@ function hideDot(dot) {
   dot.style.top = "-9999px";
 }
 
+function showCross(x, y) {
+  const cross = document.getElementById("calTargetCross");
+  if (!cross) return;
+  showDot(cross, x, y);
+}
+function hideCross() {
+  const cross = document.getElementById("calTargetCross");
+  if (!cross) return;
+  hideDot(cross);
+}
+
 let Seeso = null;
 let InitializationErrorType = null;
 let TrackingState = null;
@@ -91,13 +130,18 @@ let UserStatusOption = null;
 let seeso = null;
 let stream = null;
 
-let trackingStateLast = null;
-let trackingReadyResolve = null;
-
 let calibrating = false;
 let lastCalProgress = 0;
+let nextPointSeen = false;
+let calRestartedOnce = false;
+
+let trackingStateLast = null;
+let stableSuccessSince = null;
+
+// calibration timers
 let collectTimer = null;
-let collectRetryTimer = null;
+let progressWatchTimer = null;
+let noNextPointTimer = null;
 
 function updateCoi() {
   setPill(els.pillCoi, "coi", window.crossOriginIsolated ? "enabled" : "disabled");
@@ -107,21 +151,17 @@ async function requestCamera() {
   setStatus("Requesting camera permission...");
   setPill(els.pillPerm, "perm", "requesting");
 
-  // 권한 먼저 확보
   stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
 
   setPill(els.pillPerm, "perm", "granted");
 
-  // 프리뷰 표시
   if (els.preview) {
     els.preview.srcObject = stream;
     els.preview.muted = true;
     els.preview.playsInline = true;
     try {
       await els.preview.play();
-    } catch (_) {
-      // 자동재생 정책으로 play가 실패해도 tracking에는 영향 없음
-    }
+    } catch (_) {}
   }
 
   return stream;
@@ -129,7 +169,8 @@ async function requestCamera() {
 
 async function loadSeeso() {
   setStatus("Loading SDK module...");
-  // 중요: app.js는 /js/에 있으므로 ../seeso/... 로 올라가야 함
+
+  // app.js는 /js/에 있으므로 ../seeso/... 로 올라가야 합니다.
   const mod = await loadWebpackModule("../seeso/dist/seeso.js");
 
   Seeso = mod.default;
@@ -149,46 +190,22 @@ async function initSdk() {
 
   seeso = new Seeso();
 
-  // userStatus는 끄는 값(0,0,0)로 전달 (불필요 기능 off)
+  // userStatus 옵션은 모두 off (필요시 조정)
   const userStatus = new UserStatusOption(0, 0, 0);
 
   const errCode = await seeso.initialize(LICENSE_KEY, userStatus);
 
   if (errCode !== InitializationErrorType.ERROR_NONE) {
-    // errCode=4는 dev키를 공개 도메인에서 사용했을 때(배포)
     throw new Error(`SDK initialization failed (errCode=${errCode})`);
   }
 
   setPill(els.pillSdk, "sdk", "initialized");
 }
 
-function waitForTrackingSuccess(timeoutMs = 8000) {
-  if (trackingStateLast === TrackingState.SUCCESS) return Promise.resolve();
-
-  return new Promise((resolve, reject) => {
-    trackingReadyResolve = resolve;
-    const t0 = Date.now();
-    const timer = setInterval(() => {
-      if (trackingStateLast === TrackingState.SUCCESS) {
-        clearInterval(timer);
-        trackingReadyResolve = null;
-        resolve();
-        return;
-      }
-      if (Date.now() - t0 > timeoutMs) {
-        clearInterval(timer);
-        trackingReadyResolve = null;
-        reject(new Error("Tracking not ready (face missing / low confidence)."));
-      }
-    }, 120);
-  });
-}
-
 function startTracking() {
   setStatus("Starting tracking...");
   setPill(els.pillTrack, "track", "starting");
 
-  // gaze callback
   seeso.addGazeCallback((gazeInfo) => {
     const x = gazeInfo?.x;
     const y = gazeInfo?.y;
@@ -197,22 +214,23 @@ function startTracking() {
     trackingStateLast = ts;
 
     if (ts === TrackingState.SUCCESS) {
-      setPill(els.pillTrack, "track", "running");
-      showDot(gazeDot, x, y);
+      // 안정 SUCCESS 시작 시각 기록
+      if (stableSuccessSince == null) stableSuccessSince = Date.now();
 
-      if (typeof trackingReadyResolve === "function") {
-        const r = trackingReadyResolve;
-        trackingReadyResolve = null;
-        r();
+      setPill(els.pillTrack, "track", calibrating ? "running (cal)" : "running");
+
+      // 캘리브레이션 중에는 시선점을 숨겨서 “타겟 점”만 보게 함
+      if (!calibrating) {
+        showDot(gazeDot, x, y);
+      } else {
+        hideDot(gazeDot);
       }
-    } else if (ts === TrackingState.FACE_MISSING) {
-      setPill(els.pillTrack, "track", "face missing");
-      hideDot(gazeDot);
-    } else if (ts === TrackingState.LOW_CONFIDENCE) {
-      setPill(els.pillTrack, "track", "low confidence");
-      hideDot(gazeDot);
     } else {
-      setPill(els.pillTrack, "track", "unknown");
+      stableSuccessSince = null;
+      if (ts === TrackingState.FACE_MISSING) setPill(els.pillTrack, "track", "face missing");
+      else if (ts === TrackingState.LOW_CONFIDENCE) setPill(els.pillTrack, "track", "low confidence");
+      else setPill(els.pillTrack, "track", "unknown");
+
       hideDot(gazeDot);
     }
   });
@@ -221,6 +239,17 @@ function startTracking() {
   if (!ok) throw new Error("Failed to start tracking.");
 
   setPill(els.pillTrack, "track", "running");
+}
+
+async function waitForTrackingStable(requiredMs = 800, timeoutMs = 10000) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    if (trackingStateLast === TrackingState.SUCCESS && stableSuccessSince != null) {
+      if (Date.now() - stableSuccessSince >= requiredMs) return;
+    }
+    await new Promise((r) => setTimeout(r, 80));
+  }
+  throw new Error("Tracking not stable enough for calibration (face missing / low confidence).");
 }
 
 function normalizeProgress(p) {
@@ -233,8 +262,17 @@ function normalizeProgress(p) {
   return 0;
 }
 
-function scheduleCollectSamples() {
-  // 핵심: NextPoint 받은 뒤, 점이 표시된 다음 1회 호출해야 progress가 올라감
+function clearCalTimers() {
+  clearTimeout(collectTimer);
+  clearInterval(progressWatchTimer);
+  clearTimeout(noNextPointTimer);
+  collectTimer = null;
+  progressWatchTimer = null;
+  noNextPointTimer = null;
+}
+
+function startCollectSamplesSafely() {
+  // UI 렌더 이후 호출(권장 패턴)
   clearTimeout(collectTimer);
   collectTimer = setTimeout(() => {
     try {
@@ -242,83 +280,175 @@ function scheduleCollectSamples() {
     } catch (e) {
       console.error("startCollectSamples failed:", e);
     }
-  }, 200);
+  }, 450);
+}
 
-  // 안전장치: 0%가 오래 지속되면(타이밍 미스), 제한적으로 1회 재호출
-  clearTimeout(collectRetryTimer);
-  collectRetryTimer = setTimeout(() => {
-    if (!calibrating) return;
-    if (lastCalProgress > 0) return;
-    try {
-      seeso.startCollectSamples();
-    } catch (_) {}
-  }, 1800);
+function stopCalibrationQuiet() {
+  try {
+    seeso.stopCalibration();
+  } catch (_) {}
 }
 
 async function startOnePointCalibrationAuto() {
   if (calibrating) return;
 
+  setPill(els.pillCal, "cal", "preparing");
   setStatus("Waiting for stable tracking before calibration...");
-  await waitForTrackingSuccess(8000);
+  await waitForTrackingStable(900, 12000);
 
+  // 상태 초기화
   calibrating = true;
   lastCalProgress = 0;
+  nextPointSeen = false;
 
   setPill(els.pillCal, "cal", "running");
-  setStatus("Calibrating... 0% (keep your head steady, look at the green dot)");
+  setStatus("Calibrating... 0% (keep your head steady, look at the green target)");
 
-  // 콜백 등록
+  // 기존 캘리브레이션이 남아 있으면 정리
+  stopCalibrationQuiet();
+  clearCalTimers();
+
   const onNextPoint = (x, y) => {
-    // SDK가 준 좌표 그대로 사용해야 함(중요)
-    showDot(calDot, x, y);
-    scheduleCollectSamples();
+    nextPointSeen = true;
+
+    // 캘리브레이션 중에는 gazeDot 숨김 + 타겟만 표시
+    hideDot(gazeDot);
+
+    // 타겟 표시(고정)
+    showDot(calTarget, x, y);
+    showCross(x, y);
+
+    setStatus(
+      `Calibrating... 0% (target at x=${Math.round(x)}, y=${Math.round(y)}). Keep head steady and stare at the target.`
+    );
+
+    // 렌더 후 샘플 수집 시작
+    // requestAnimationFrame 2번으로 실제 페인트를 더 확실히 보장
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        startCollectSamplesSafely();
+      });
+    });
   };
 
   const onProgress = (pRaw) => {
     const p = normalizeProgress(pRaw);
     lastCalProgress = Math.max(lastCalProgress, p);
+
     const pct = clamp(Math.round(p * 100), 0, 100);
-    setStatus(`Calibrating... ${pct}% (keep your head steady, look at the green dot)`);
+    setStatus(`Calibrating... ${pct}% (keep your head steady, stare at the target)`);
   };
 
-  const onFinish = (calibrationData) => {
+  const onFinish = () => {
     calibrating = false;
-    hideDot(calDot);
+    clearCalTimers();
+
+    hideDot(calTarget);
+    hideCross();
+
     setPill(els.pillCal, "cal", "done");
+    setPill(els.pillTrack, "track", "running");
     setStatus("Calibration finished. Tracking is running.");
-    // 필요하면 calibrationData 저장 가능
-    // console.log("calibrationData:", calibrationData);
   };
 
-  // 중복 등록 방지(재시작 대비)
-  try {
-    seeso.removeCalibrationNextPointCallback(onNextPoint);
-    seeso.removeCalibrationProgressCallback(onProgress);
-    seeso.removeCalibrationFinishCallback(onFinish);
-  } catch (_) {}
-
+  // 콜백 등록 (startCalibration 이전에 등록)
   seeso.addCalibrationNextPointCallback(onNextPoint);
   seeso.addCalibrationProgressCallback(onProgress);
   seeso.addCalibrationFinishCallback(onFinish);
 
-  // 1점 + 기본 정확도
   const ok = seeso.startCalibration(1, CalibrationAccuracyCriteria.DEFAULT);
   if (!ok) {
     calibrating = false;
-    hideDot(calDot);
     setPill(els.pillCal, "cal", "-");
+    hideDot(calTarget);
+    hideCross();
     throw new Error("Calibration did not start (startCalibration returned false).");
   }
+
+  // 1) NextPoint가 아예 오지 않는 경우 감지
+  noNextPointTimer = setTimeout(() => {
+    if (!calibrating) return;
+    if (nextPointSeen) return;
+
+    // 1회만 재시작 시도
+    if (!calRestartedOnce) {
+      calRestartedOnce = true;
+      setStatus("Calibration target not received. Restarting calibration once...");
+      stopCalibrationQuiet();
+      calibrating = false;
+      startOnePointCalibrationAuto().catch((e) => {
+        console.error(e);
+        setStatus(`Error: ${e?.message || e}`);
+        setPill(els.pillCal, "cal", "-");
+      });
+    } else {
+      setStatus("Calibration target not received. Please reload and try again.");
+      setPill(els.pillCal, "cal", "-");
+    }
+  }, 1500);
+
+  // 2) 0%가 계속 유지되는 경우(샘플 수집 재호출/재시작)
+  progressWatchTimer = setInterval(() => {
+    if (!calibrating) return;
+
+    // NextPoint가 왔는데도 progress가 계속 0이면 샘플수집 타이밍/응시 문제 가능
+    if (nextPointSeen && lastCalProgress <= 0) {
+      // tracking이 SUCCESS일 때만 재호출
+      if (trackingStateLast === TrackingState.SUCCESS) {
+        try {
+          seeso.startCollectSamples();
+        } catch (_) {}
+      }
+    }
+
+    // 너무 오래(예: 6초) 0이면 1회 재시작
+    const tooLongZero = nextPointSeen && lastCalProgress <= 0;
+    if (tooLongZero) {
+      // 6초 기준: interval(500ms)*12
+      // 이 조건은 아래처럼 누적 체크로 구현
+    }
+  }, 500);
+
+  // “6초 0%” 재시작용 누적 카운터
+  let zeroTicks = 0;
+  const zeroCounter = setInterval(() => {
+    if (!calibrating) {
+      clearInterval(zeroCounter);
+      return;
+    }
+    if (nextPointSeen && lastCalProgress <= 0) {
+      zeroTicks += 1;
+    } else {
+      zeroTicks = 0;
+    }
+
+    if (zeroTicks >= 12) {
+      clearInterval(zeroCounter);
+
+      if (!calRestartedOnce) {
+        calRestartedOnce = true;
+        setStatus("Calibration stuck at 0%. Restarting calibration once...");
+        stopCalibrationQuiet();
+        calibrating = false;
+        startOnePointCalibrationAuto().catch((e) => {
+          console.error(e);
+          setStatus(`Error: ${e?.message || e}`);
+          setPill(els.pillCal, "cal", "-");
+        });
+      } else {
+        setStatus("Calibration stuck at 0%. Please reload and try again.");
+        setPill(els.pillCal, "cal", "-");
+      }
+    }
+  }, 500);
 }
 
 function cleanup() {
-  clearTimeout(collectTimer);
-  clearTimeout(collectRetryTimer);
-  collectTimer = null;
-  collectRetryTimer = null;
+  clearCalTimers();
 
   hideDot(gazeDot);
-  hideDot(calDot);
+  hideDot(calTarget);
+  hideCross();
 
   try {
     if (seeso) {
