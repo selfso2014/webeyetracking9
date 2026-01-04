@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>SeeSo Web Demo (1-point calibration)</title>
+    <link rel="stylesheet" href="./css/style.css" />
+    <script src="./coi-serviceworker.js"></script>
+  </head>
+  <body>
+    <div id="stage">
+      <video id="preview"></video>
+      <canvas id="output"></canvas>
+    </div>
+
+    <div id="hud">
+      <p id="title">SeeSo Eye Tracking Web Demo</p>
+      <p id="status">Loading...</p>
+      <div id="pills">
+        <span class="pill" id="pillCoi">coi: -</span>
+        <span class="pill" id="pillPerm">perm: -</span>
+        <span class="pill" id="pillSdk">sdk: -</span>
+        <span class="pill" id="pillTrack">track: -</span>
+        <span class="pill" id="pillCal">cal: -</span>
+
+        <button id="btnRetry" type="button">Reload</button>
+      </div>
+    </div>
+
+    <script type="module" src="./js/app.js"></script>
+  </body>
+</html>
